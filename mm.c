@@ -30,18 +30,18 @@
 /********** My macros and variables **********/
 typedef size_t block_header;
 typedef size_t block_footer;
-
 #define OVERHEAD  (sizeof(block_header) + sizeof(block_footer))
 #define LISTLIMIT 20 // Maximum number of segregated free lists
 #define MAX(x, y)      ((x) > (y) ? (x) : (y))
 #define MIN(x, y)      ((x) < (y) ? (x) : (y))
+void *segregated_free_lists[LISTLIMIT];
 
 // Combine a size and alloc bit
 #define PACK(size, alloc)  ((size) | (alloc))
 
 // Get address of header/footer of ptr block
 #define HDRP(ptr)  ((char *)(ptr) - sizeof(block_header))
-#define FTRP(ptr)  ((char *)(ptr) + GET_SIZE(HEAD(ptr)) - OVERHEAD)
+#define FTRP(ptr)  ((char *)(ptr) + GET_SIZE(HDRP(ptr)) - OVERHEAD)
 
 // Given a pointer to a header, get or set its value
 #define GET(ptr)       (*(size_t *)(ptr))
@@ -52,10 +52,15 @@ typedef size_t block_footer;
 #define GET_ALLOC(ptr)  (GET(ptr) & 0x1)
 
 // Address of adjacent blocks
-#define NEXT_BLKP(ptr)  ((char *)(ptr) + GET_SIZE(HEAD(ptr))
+#define NEXT_BLKP(ptr)  ((char *)(ptr) + GET_SIZE(HDRP(ptr))
 #define PREV_BLKP(ptr)  ((char *)(ptr) - GET_SIZE((char *)(ptr) - OVERHEAD))
 
-void *segregated_free_lists[LISTLIMIT];
+// Address of free block's predecessor and successor entries
+#define PRED(ptr)      (*(char **)(ptr))
+#define SUCC(ptr)      (*(char **)(SUCC_PTR(ptr)))
+#define PRED_PTR(ptr)  ((char *)(ptr))
+#define SUCC_PTR(ptr)  ((char *)(ptr) + sizeof(block_header))
+#define SET_PTR(p, ptr)  (*(size_t *)(p) = (size_t)(ptr))
 /********** End of my macros and variables **********/
 
 /********** Helper functions **********/
@@ -65,7 +70,9 @@ void *segregated_free_lists[LISTLIMIT];
  * Update free list if applicable
  * Split block if applicable
  */
-static void set_allocated(void *b, size_t size);
+static void set_allocated(void *b, size_t size) {
+  return;
+}
 
 /*
  * Request more memory by calling mem_map
@@ -74,13 +81,69 @@ static void set_allocated(void *b, size_t size);
  *  - full_size = ALIGN(size + OVERHEAD)
  * Update free list if applicable
  */
-static void extend(size_t s);
+static void extend(size_t s) {
+  return;
+}
+
+/*
+ * Inserts a free block into the segregated free lists
+ */
+static void insert_node(void *ptr, size_t size) {
+  int list = 0;
+  void *search_ptr = ptr;
+  void *insert_ptr = NULL;
+
+  // Select segregated list based on size
+  while ((list < LISTLIMIT - 1) && (size > 1)) {
+    size >>= 1;
+    list++;
+  }
+
+  // Keep size-ascending order and search
+  search_ptr = segregated_free_lists[list];
+  while ((search_ptr != NULL) && (size > GET_SIZE(HDRP(search_ptr)))) {
+    insert_ptr = search_ptr;
+    search_ptr = PRED(search_ptr);
+  }
+
+  // Set predecessor and successor
+  if (search_ptr != NULL) {
+    if (insert_ptr != NULL) {
+      SET_PTR(PRED_PTR(ptr), search_ptr);
+      SET_PTR(SUCC_PTR(search_ptr), ptr);
+      SET_PTR(SUCC_PTR(ptr), insert_ptr);
+      SET_PTR(PRED_PTR(insert_ptr), ptr);
+    }
+    else {
+      SET_PTR(PRED_PTR(ptr), search_ptr);
+      SET_PTR(SUCC_PTR(search_ptr), ptr);
+      SET_PTR(SUCC_PTR(ptr), NULL);
+      segregated_free_lists[list] = ptr;
+    }
+  }
+  else {
+    if (insert_ptr != NULL) {
+      SET_PTR(PRED_PTR(ptr), NULL);
+      SET_PTR(SUCC_PTR(ptr), insert_ptr);
+      SET_PTR(PRED_PTR(insert_ptr), ptr);
+    }
+    else {
+      SET_PTR(PRED_PTR(ptr), NULL);
+      SET_PTR(SUCC_PTR(ptr), NULL);
+      segregated_free_lists[list] = ptr;
+    }
+  }
+
+  return;
+}
 
 /*
  * Coalesce a free block if applicable
  * Returns pointer to new coalesced block
  */
-static void* coalesce(void *bp);
+static void* coalesce(void *bp) {
+  return NULL;
+}
 /********** End of helper functions **********/
 
 void *current_avail = NULL;
@@ -108,7 +171,7 @@ void *mm_malloc(size_t size)
     return NULL;
 
   // Align block size
-  size_t asize = ALIGN(size);
+  size_t newsize = ALIGN(size);
   void *p;
 
   if (current_avail_size < newsize) {
@@ -126,18 +189,23 @@ void *mm_malloc(size_t size)
 }
 
 /*
- * mm_free - Freeing a block does nothing.
+ * mm_free - Frees the block pointed to by ptr, coalescing if applicable.
+ * Returns nothing.
  */
 void mm_free(void *ptr)
 {
   // Set the header allocated bit to 0
-  block_header* hdr = HDRP(ptr);
+  block_header* hdr = (block_header *)HDRP(ptr);
   size_t size = GET_SIZE(hdr);
   PUT(hdr, PACK(size, 0));
 
   // Similar for the footer
-  block_footer* ftr = FTRP(ptr);
+  block_footer* ftr = (block_footer *)FTRP(ptr);
   PUT(ftr, PACK(size, 0));
 
   // Coalesce, if applicable
+  insert_node(ptr, size);
+  coalesce(ptr);
+
+  return;
 }
