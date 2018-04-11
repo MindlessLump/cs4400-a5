@@ -31,9 +31,10 @@
 typedef size_t block_header;
 typedef size_t block_footer;
 #define OVERHEAD   (sizeof(block_header) + sizeof(block_footer))
+#define INIT_SIZE  4096
 #define MAX(x, y)  ((x) > (y) ? (x) : (y))
 #define MIN(x, y)  ((x) < (y) ? (x) : (y))
-void *first_free;
+void *first_free = NULL;
 
 // Combine a size and alloc bit
 #define PACK(size, alloc)  ((size) | (alloc))
@@ -230,27 +231,8 @@ static void *coalesce(void *ptr) {
  */
 int mm_init(void)
 {
-  // Initialize segregated free lists
+  printf("mm_init called.");
   first_free = NULL;
-
-  // Initialize an empty heap
-  char *heap_start;
-  if ((long)(heap_start = mem_map(mem_pagesize())) == -1)
-    return -1;
-
-  // After 8 bytes of padding, set sentinel block of size OVERHEAD as allocated
-  PUT(HDRP(heap_start+OVERHEAD), PACK(OVERHEAD, 1));
-  PUT(FTRP(heap_start+OVERHEAD), PACK(OVERHEAD, 1));
-  // Add terminator at end of page
-  PUT(HDRP(heap_start+mem_pagesize()), PACK(0, 1));
-  // Add a free block spanning the middle of the page
-  heap_start += OVERHEAD << 1;
-  size_t size = mem_pagesize() - (OVERHEAD + sizeof(block_header));
-  PUT(HDRP(heap_start), PACK(mem_pagesize(), 0));
-  PUT(FTRP(heap_start), PACK(mem_pagesize(), 0));
-
-  insert_node(heap_start, size);
-
   return 0;
 }
 
@@ -281,7 +263,7 @@ void *mm_malloc(size_t size)
 
   // If a free block that fits isn't found, extend the heap
   if (ptr == NULL) {
-    size_t extendsize = MAX(asize, mem_pagesize());
+    size_t extendsize = PAGE_ALIGN(asize);
     if ((ptr = extend(extendsize)) == NULL)
       return NULL;
   }

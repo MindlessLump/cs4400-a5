@@ -1,6 +1,6 @@
 #include <unistd.h>
 
-void mem_init(void);
+void mem_init(void);               
 void mem_reset(void);
 
 size_t mem_pagesize(void);
