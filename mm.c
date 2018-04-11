@@ -31,10 +31,9 @@
 typedef size_t block_header;
 typedef size_t block_footer;
 #define OVERHEAD   (sizeof(block_header) + sizeof(block_footer))
-#define LISTLIMIT 20 // Maximum number of segregated free lists
 #define MAX(x, y)  ((x) > (y) ? (x) : (y))
 #define MIN(x, y)  ((x) < (y) ? (x) : (y))
-void *segregated_free_lists[LISTLIMIT];
+void *first_free;
 
 // Combine a size and alloc bit
 #define PACK(size, alloc)  ((size) | (alloc))
@@ -56,97 +55,51 @@ void *segregated_free_lists[LISTLIMIT];
 #define PREV_BLKP(ptr)  ((char *)(ptr) - GET_SIZE((char *)(ptr) - OVERHEAD))
 
 // Address of free block's predecessor and successor entries
-#define PRED(ptr)      (*(char **)(ptr))
-#define SUCC(ptr)      (*(char **)(SUCC_PTR(ptr)))
-#define PRED_PTR(ptr)  ((char *)(ptr))
-#define SUCC_PTR(ptr)  ((char *)(ptr) + sizeof(block_header))
-#define SET_PTR(p, ptr)  (*(size_t *)(p) = (size_t)(ptr))
+#define F_PREV(ptr)      (*(char **)(ptr))
+#define F_NEXT(ptr)      (*(char **)(F_NEXT_PTR(ptr)))
+#define F_PREV_PTR(ptr)  ((char *)(ptr))
+#define F_NEXT_PTR(ptr)  ((char *)(ptr) + sizeof(block_header))
+#define F_SET_PTR(p, ptr)  (*(size_t *)(p) = (size_t)(ptr))
 /********** End of my macros and variables **********/
 
 
 /********** Helper functions **********/
 
 /*
- * Inserts a free block into the segregated free lists
+ * Inserts a free block into the explicit free list (prepend)
  */
 static void insert_node(void *ptr, size_t size) {
-  int list = 0;
-  void *search_ptr = ptr;
-  void *insert_ptr = NULL;
-
-  // Select segregated list based on size
-  while ((list < LISTLIMIT - 1) && (size > 1)) {
-    size >>= 1;
-    list++;
-  }
-
-  // Keep size-ascending order and search
-  search_ptr = segregated_free_lists[list];
-  while ((search_ptr != NULL) && (size > GET_SIZE(HDRP(search_ptr)))) {
-    insert_ptr = search_ptr;
-    search_ptr = PRED(search_ptr);
-  }
-
-  // Set predecessor and successor
-  if (search_ptr != NULL) {
-    if (insert_ptr != NULL) {
-      SET_PTR(PRED_PTR(ptr), search_ptr);
-      SET_PTR(SUCC_PTR(search_ptr), ptr);
-      SET_PTR(SUCC_PTR(ptr), insert_ptr);
-      SET_PTR(PRED_PTR(insert_ptr), ptr);
-    }
-    else {
-      SET_PTR(PRED_PTR(ptr), search_ptr);
-      SET_PTR(SUCC_PTR(search_ptr), ptr);
-      SET_PTR(SUCC_PTR(ptr), NULL);
-      segregated_free_lists[list] = ptr;
-    }
-  }
-  else {
-    if (insert_ptr != NULL) {
-      SET_PTR(PRED_PTR(ptr), NULL);
-      SET_PTR(SUCC_PTR(ptr), insert_ptr);
-      SET_PTR(PRED_PTR(insert_ptr), ptr);
-    }
-    else {
-      SET_PTR(PRED_PTR(ptr), NULL);
-      SET_PTR(SUCC_PTR(ptr), NULL);
-      segregated_free_lists[list] = ptr;
-    }
-  }
-
+  F_SET_PTR(F_PREV_PTR(first_free), ptr);
+  F_SET_PTR(F_NEXT_PTR(ptr), first_free);
+  F_SET_PTR(F_PREV_PTR(ptr), NULL);
+  first_free = ptr;
   return;
 }
 
 /*
  * Deletes a node from the segregated free lists
+ * Case 1: Has a previous and a next free block
+ * Case 2: Has a previous free block only
+ * Case 3: Has a next free block only
+ * Case 4: No previous or next free blocks
  */
 static void delete_node(void *ptr) {
-  int list = 0;
-  size_t size = GET_SIZE(HDRP(ptr));
-
-  // Select the segregated list based on size
-  while ((list < LISTLIMIT - 1) && (size > 1)) {
-    size >>= 1;
-    list++;
-  }
-
-  if (PRED(ptr) != NULL) {
-    if (SUCC(ptr) != NULL) {
-      SET_PTR(SUCC_PTR(PRED(ptr)), SUCC(ptr));
-      SET_PTR(PRED_PTR(SUCC(ptr)), PRED(ptr));
+  if (F_PREV(ptr) != NULL) {
+    if (F_NEXT(ptr) != NULL) {  // Case 1
+      F_SET_PTR(F_NEXT_PTR(F_PREV(ptr)), F_NEXT(ptr));
+      F_SET_PTR(F_PREV_PTR(F_NEXT(ptr)), F_PREV(ptr));
     }
-    else {
-      SET_PTR(SUCC_PTR(PRED(ptr)), NULL);
-      segregated_free_lists[list] = PRED(ptr);
+    else {                      // Case 2
+      F_SET_PTR(F_NEXT_PTR(F_PREV(ptr)), NULL);
     }
   }
   else {
-    if (SUCC(ptr) != NULL) {
-      SET_PTR(PRED_PTR(SUCC(ptr)), NULL);
+    if (F_NEXT(ptr) != NULL) {    // Case 3
+      F_SET_PTR(F_PREV_PTR(F_NEXT(ptr)), NULL);
+      first_free = F_NEXT(ptr);
     }
-    else {
-      segregated_free_lists[list] = NULL;
+    else {                      // Case 4
+      first_free = NULL;
     }
   }
 
@@ -278,10 +231,7 @@ static void *coalesce(void *ptr) {
 int mm_init(void)
 {
   // Initialize segregated free lists
-  int list;
-  for (list = 0; list < LISTLIMIT; list++) {
-    segregated_free_lists[list] = NULL;
-  }
+  first_free = NULL;
 
   // Initialize an empty heap
   char *heap_start;
@@ -316,24 +266,17 @@ void *mm_malloc(size_t size)
 
   // Align block size
   size_t asize = ALIGN(size + OVERHEAD);
-  void *ptr;
+  void *ptr = first_free;
 
-  int list = 0;
-  size_t searchsize = asize;
-  // Search for a free block in the segregated lists
-  while (list < LISTLIMIT) {
-    if ((list == LISTLIMIT - 1) ||
-        ((searchsize <= 1) && (segregated_free_lists[list] != NULL))) {
-      ptr = segregated_free_lists[list];
-      // Ignore blocks that are too small
-      while ((ptr != NULL) && (asize > GET_SIZE(HDRP(ptr)))) {
-        ptr = PRED(ptr);
-      }
-      if (ptr != NULL)
-        break;
+  // Search for a free block of adequate size
+  while (ptr != NULL) {
+    if (asize > GET_SIZE(HDRP(ptr))) {  // Too small, check next free block
+      ptr = F_NEXT(ptr);
+      continue;
     }
-    searchsize >>= 1;
-    list++;
+    else {  // Size is adequate. Proceed to allocation
+      break;
+    }
   }
 
   // If a free block that fits isn't found, extend the heap
