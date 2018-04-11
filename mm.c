@@ -30,10 +30,10 @@
 /********** My macros and variables **********/
 typedef size_t block_header;
 typedef size_t block_footer;
-#define OVERHEAD  (sizeof(block_header) + sizeof(block_footer))
+#define OVERHEAD   (sizeof(block_header) + sizeof(block_footer))
 #define LISTLIMIT 20 // Maximum number of segregated free lists
-#define MAX(x, y)      ((x) > (y) ? (x) : (y))
-#define MIN(x, y)      ((x) < (y) ? (x) : (y))
+#define MAX(x, y)  ((x) > (y) ? (x) : (y))
+#define MIN(x, y)  ((x) < (y) ? (x) : (y))
 void *segregated_free_lists[LISTLIMIT];
 
 // Combine a size and alloc bit
@@ -52,7 +52,7 @@ void *segregated_free_lists[LISTLIMIT];
 #define GET_ALLOC(ptr)  (GET(ptr) & 0x1)
 
 // Address of adjacent blocks
-#define NEXT_BLKP(ptr)  ((char *)(ptr) + GET_SIZE(HDRP(ptr))
+#define NEXT_BLKP(ptr)  ((char *)(ptr) + GET_SIZE(HDRP(ptr)))
 #define PREV_BLKP(ptr)  ((char *)(ptr) - GET_SIZE((char *)(ptr) - OVERHEAD))
 
 // Address of free block's predecessor and successor entries
@@ -63,27 +63,8 @@ void *segregated_free_lists[LISTLIMIT];
 #define SET_PTR(p, ptr)  (*(size_t *)(p) = (size_t)(ptr))
 /********** End of my macros and variables **********/
 
-/********** Helper functions **********/
-/*
- * Set a block to allocated
- * Update block headers/footers as needed
- * Update free list if applicable
- * Split block if applicable
- */
-static void set_allocated(void *b, size_t size) {
-  return;
-}
 
-/*
- * Request more memory by calling mem_map
- * Initialize the new chunk of memory as applicable
- *  - 8 bytes of padding needed at the start of every page
- *  - full_size = ALIGN(size + OVERHEAD)
- * Update free list if applicable
- */
-static void extend(size_t s) {
-  return;
-}
+/********** Helper functions **********/
 
 /*
  * Inserts a free block into the segregated free lists
@@ -138,11 +119,125 @@ static void insert_node(void *ptr, size_t size) {
 }
 
 /*
+ * Deletes a node from the segregated free lists
+ */
+static void delete_node(void *ptr) {
+  int list = 0;
+  size_t size = GET_SIZE(HDRP(ptr));
+
+  // Select the segregated list based on size
+  while ((list < LISTLIMIT - 1) && (size > 1)) {
+    size >>= 1;
+    list++;
+  }
+
+  if (PRED(ptr) != NULL) {
+    if (SUCC(ptr) != NULL) {
+      SET_PTR(SUCC_PTR(PRED(ptr)), SUCC(ptr));
+      SET_PTR(PRED_PTR(SUCC(ptr)), PRED(ptr));
+    }
+    else {
+      SET_PTR(SUCC_PTR(PRED(ptr)), NULL);
+      segregated_free_lists[list] = PRED(ptr);
+    }
+  }
+  else {
+    if (SUCC(ptr) != NULL) {
+      SET_PTR(PRED_PTR(SUCC(ptr)), NULL);
+    }
+    else {
+      segregated_free_lists[list] = NULL;
+    }
+  }
+
+  return;
+}
+
+/*
+ * Set a block to allocated
+ * Update block headers/footers as needed
+ * Update free list if applicable
+ * Split block if applicable
+ */
+static void set_allocated(void *b, size_t size) {
+  return;
+}
+
+/*
+ * Request more memory by calling mem_map
+ * Initialize the new chunk of memory as applicable
+ *  - 8 bytes of padding needed at the start of every page
+ *  - Use a sentinel block (header+footer) at the start of every page
+ *  - Add a terminator block (header) at the end of every page
+ *  - full_size = ALIGN(size + OVERHEAD)
+ * Update free list if applicable
+ */
+static void extend(size_t s) {
+  void *ptr;
+  size_t asize = ALIGN(s + OVERHEAD);
+  asize = MAX(asize, mem_pagesize());
+
+  if ((ptr = mem_map(asize)) == (void *)-1)
+    return;
+
+  // After 8 bytes of padding, set sentinel block of size OVERHEAD as allocated
+  PUT(HDRP(ptr+OVERHEAD), PACK(OVERHEAD, 1));
+  PUT(FTRP(ptr+OVERHEAD), PACK(OVERHEAD, 0));
+  // Add terminator at end of page
+  PUT(HDRP(ptr+asize), PACK(0, 1));
+  // Add a free block spanning the middle of the page
+  ptr += OVERHEAD << 1;
+  asize -= OVERHEAD + sizeof(block_header);
+  PUT(HDRP(ptr), PACK(asize, 0));
+  PUT(FTRP(ptr), PACK(asize, 0));
+
+  insert_node(ptr, asize);
+  return;
+}
+
+/*
  * Coalesce a free block if applicable
  * Returns pointer to new coalesced block
+ * Case 1: No adjacent free blocks.
+ * Case 2: Next block is free.
+ * Case 3: Previous block is free.
+ * Case 4: Previous and next blocks are free.
  */
-static void* coalesce(void *bp) {
-  return NULL;
+static void* coalesce(void *ptr) {
+  size_t prev_alloc = GET_ALLOC(HDRP(PREV_BLKP(ptr)));
+  size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
+  size_t size = GET_SIZE(HDRP(ptr));
+
+  if (prev_alloc && next_alloc) {        // Case 1 (return as-is)
+    return ptr;
+  }
+  else if (prev_alloc && !next_alloc) {  // Case 2 (coalesce with right)
+    delete_node(ptr);
+    delete_node(NEXT_BLKP(ptr));
+    size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    PUT(HDRP(ptr), PACK(size, 0));
+    PUT(FTRP(ptr), PACK(size, 0));
+  }
+  else if (!prev_alloc && next_alloc) {  // Case 3 (coalesce with left)
+    delete_node(ptr);
+    delete_node(PREV_BLKP(ptr));
+    size += GET_SIZE(HDRP(PREV_BLKP(ptr)));
+    PUT(FTRP(ptr), PACK(size, 0));
+    PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
+    ptr = PREV_BLKP(ptr);
+  }
+  else {                                 // Case 4 (coalesce with both sides)
+    delete_node(ptr);
+    delete_node(PREV_BLKP(ptr));
+    delete_node(NEXT_BLKP(ptr));
+    size += GET_SIZE(HDRP(PREV_BLKP(ptr))) + GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
+    PUT(FTRP(NEXT_BLKP(ptr)), PACK(size, 0));
+    ptr = PREV_BLKP(ptr);
+  }
+
+  insert_node(ptr, size);
+  return ptr;
 }
 /********** End of helper functions **********/
 
@@ -156,6 +251,7 @@ int mm_init(void)
 {
   current_avail = NULL;
   current_avail_size = 0;
+  memset(segregated_free_lists, 0, sizeof(segregated_free_lists));
 
   return 0;
 }
