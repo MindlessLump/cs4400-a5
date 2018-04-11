@@ -159,8 +159,7 @@ static void delete_node(void *ptr) {
  * Update free list if applicable
  * Split block if applicable
  */
-static void set_allocated(void *ptr, size_t size) {
-  size_t asize = ALIGN(size + OVERHEAD);
+static void *set_allocated(void *ptr, size_t asize) {
   size_t free_size = GET_SIZE(HDRP(ptr));
   size_t remain = free_size - asize;
 
@@ -177,6 +176,8 @@ static void set_allocated(void *ptr, size_t size) {
     PUT(FTRP(NEXT_BLKP(ptr)), PACK(remain, 0));
     insert_node(NEXT_BLKP(ptr), remain);
   }
+
+  return ptr;
 }
 
 /*
@@ -187,13 +188,11 @@ static void set_allocated(void *ptr, size_t size) {
  *  - Add a terminator block (header) at the end of every page
  * Update free list if applicable
  */
-static void extend(size_t s) {
+static void *extend(size_t asize) {
   void *ptr;
-  size_t asize = ALIGN(s + OVERHEAD);
-  asize = MAX(asize, mem_pagesize());
 
   if ((ptr = mem_map(asize)) == (void *)-1)
-    return;
+    return NULL;
 
   // After 8 bytes of padding, set sentinel block of size OVERHEAD as allocated
   PUT(HDRP(ptr+OVERHEAD), PACK(OVERHEAD, 1));
@@ -207,7 +206,7 @@ static void extend(size_t s) {
   PUT(FTRP(ptr), PACK(asize, 0));
 
   insert_node(ptr, asize);
-  return;
+  return ptr;
 }
 
 /*
@@ -235,7 +234,7 @@ static void check_chunk(void *ptr) {
  * Case 3: Previous block is free.
  * Case 4: Previous and next blocks are free.
  */
-static void* coalesce(void *ptr) {
+static void *coalesce(void *ptr) {
   size_t prev_alloc = GET_ALLOC(HDRP(PREV_BLKP(ptr)));
   size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
   size_t size = GET_SIZE(HDRP(ptr));
@@ -316,10 +315,38 @@ void *mm_malloc(size_t size)
     return NULL;
 
   // Align block size
-  size_t newsize = ALIGN(size);
-  void *p;
+  size_t asize = ALIGN(size + OVERHEAD);
+  void *ptr;
 
-  return p;
+  int list = 0;
+  size_t searchsize = asize;
+  // Search for a free block in the segregated lists
+  while (list < LISTLIMIT) {
+    if ((list == LISTLIMIT - 1) ||
+        ((searchsize <= 1) && (segregated_free_lists[list] != NULL))) {
+      ptr = segregated_free_lists[list];
+      // Ignore blocks that are too small
+      while ((ptr != NULL) && (asize > GET_SIZE(HDRP(ptr)))) {
+        ptr = PRED(ptr);
+      }
+      if (ptr != NULL)
+        break;
+    }
+    searchsize >>= 1;
+    list++;
+  }
+
+  // If a free block that fits isn't found, extend the heap
+  if (ptr == NULL) {
+    size_t extendsize = MAX(asize, mem_pagesize());
+    if ((ptr = extend(extendsize)) == NULL)
+      return NULL;
+  }
+
+  // Allocate the block
+  ptr = set_allocated(ptr, asize);
+
+  return ptr;
 }
 
 /*
