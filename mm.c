@@ -159,8 +159,24 @@ static void delete_node(void *ptr) {
  * Update free list if applicable
  * Split block if applicable
  */
-static void set_allocated(void *b, size_t size) {
-  return;
+static void set_allocated(void *ptr, size_t size) {
+  size_t asize = ALIGN(size + OVERHEAD);
+  size_t free_size = GET_SIZE(HDRP(ptr));
+  size_t remain = free_size - asize;
+
+  delete_node(ptr);
+
+  if (remain <= OVERHEAD * 2) {  // Remainder too small to split
+    PUT(HDRP(ptr), PACK(free_size, 1));
+    PUT(FTRP(ptr), PACK(free_size, 1));
+  }
+  else {  // Split block
+    PUT(HDRP(ptr), PACK(asize, 1));
+    PUT(FTRP(ptr), PACK(asize, 1));
+    PUT(HDRP(NEXT_BLKP(ptr)), PACK(remain, 0));
+    PUT(FTRP(NEXT_BLKP(ptr)), PACK(remain, 0));
+    insert_node(NEXT_BLKP(ptr), remain);
+  }
 }
 
 /*
@@ -169,7 +185,6 @@ static void set_allocated(void *b, size_t size) {
  *  - 8 bytes of padding needed at the start of every page
  *  - Use a sentinel block (header+footer) at the start of every page
  *  - Add a terminator block (header) at the end of every page
- *  - full_size = ALIGN(size + OVERHEAD)
  * Update free list if applicable
  */
 static void extend(size_t s) {
@@ -182,7 +197,7 @@ static void extend(size_t s) {
 
   // After 8 bytes of padding, set sentinel block of size OVERHEAD as allocated
   PUT(HDRP(ptr+OVERHEAD), PACK(OVERHEAD, 1));
-  PUT(FTRP(ptr+OVERHEAD), PACK(OVERHEAD, 0));
+  PUT(FTRP(ptr+OVERHEAD), PACK(OVERHEAD, 1));
   // Add terminator at end of page
   PUT(HDRP(ptr+asize), PACK(0, 1));
   // Add a free block spanning the middle of the page
@@ -193,6 +208,23 @@ static void extend(size_t s) {
 
   insert_node(ptr, asize);
   return;
+}
+
+/*
+ * Check to see if a whole chunk is now free.
+ * Should be called after coalesce() does its work.
+ * The chunk is empty if the left and right neighbors are sentinels.
+ */
+static void check_chunk(void *ptr) {
+  size_t prev_size = GET_SIZE(HDRP(PREV_BLKP(ptr)));
+  size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+
+  if (prev_size == OVERHEAD && next_size == 0) {  // Free the chunk
+    size_t size = GET_SIZE(HDRP(ptr)) + OVERHEAD * 2;
+    ptr -= OVERHEAD * 2;
+    delete_node(ptr);
+    mem_unmap(ptr, size);
+  }
 }
 
 /*
@@ -241,17 +273,34 @@ static void* coalesce(void *ptr) {
 }
 /********** End of helper functions **********/
 
-void *current_avail = NULL;
-int current_avail_size = 0;
-
 /* =
  * mm_init - initialize the malloc package.
  */
 int mm_init(void)
 {
-  current_avail = NULL;
-  current_avail_size = 0;
-  memset(segregated_free_lists, 0, sizeof(segregated_free_lists));
+  // Initialize segregated free lists
+  int list;
+  for (list = 0; list < LISTLIMIT; list++) {
+    segregated_free_lists[list] = NULL;
+  }
+
+  // Initialize an empty heap
+  char *heap_start;
+  if ((long)(heap_start = mem_map(mem_pagesize())) == -1)
+    return -1;
+
+  // After 8 bytes of padding, set sentinel block of size OVERHEAD as allocated
+  PUT(HDRP(heap_start+OVERHEAD), PACK(OVERHEAD, 1));
+  PUT(FTRP(heap_start+OVERHEAD), PACK(OVERHEAD, 1));
+  // Add terminator at end of page
+  PUT(HDRP(heap_start+mem_pagesize()), PACK(0, 1));
+  // Add a free block spanning the middle of the page
+  heap_start += OVERHEAD << 1;
+  size_t size = mem_pagesize() - (OVERHEAD + sizeof(block_header));
+  PUT(HDRP(heap_start), PACK(mem_pagesize(), 0));
+  PUT(FTRP(heap_start), PACK(mem_pagesize(), 0));
+
+  insert_node(heap_start, size);
 
   return 0;
 }
@@ -269,17 +318,6 @@ void *mm_malloc(size_t size)
   // Align block size
   size_t newsize = ALIGN(size);
   void *p;
-
-  if (current_avail_size < newsize) {
-    current_avail_size = PAGE_ALIGN(newsize);
-    current_avail = mem_map(current_avail_size);
-    if (current_avail == NULL)
-      return NULL;
-  }
-
-  p = current_avail;
-  current_avail += newsize;
-  current_avail_size -= newsize;
 
   return p;
 }
@@ -302,6 +340,7 @@ void mm_free(void *ptr)
   // Coalesce, if applicable
   insert_node(ptr, size);
   coalesce(ptr);
+  check_chunk(ptr);
 
   return;
 }
