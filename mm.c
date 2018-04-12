@@ -31,7 +31,7 @@
 typedef size_t block_header;
 typedef size_t block_footer;
 #define OVERHEAD   (sizeof(block_header) + sizeof(block_footer))
-#define INIT_SIZE  4096
+#define INIT_SIZE  (1<<6)
 #define MAX(x, y)  ((x) > (y) ? (x) : (y))
 #define MIN(x, y)  ((x) < (y) ? (x) : (y))
 void *first_free = NULL;
@@ -70,40 +70,60 @@ void *first_free = NULL;
  * Inserts a free block into the explicit free list (prepend)
  */
 static void insert_node(void *ptr, size_t size) {
-  F_SET_PTR(F_PREV_PTR(first_free), ptr);
-  F_SET_PTR(F_NEXT_PTR(ptr), first_free);
+  printf("insert_node called\n - Block size: %ld\n", size);
+  // Don't insert a nonexistent block
+  if (ptr == NULL)
+    return;
+  // If there are existing free blocks, adjust the list
+  if (first_free != NULL) {
+    printf(" - Non-empty list, prepending.\n");
+    F_SET_PTR(F_PREV_PTR(first_free), ptr);
+    F_SET_PTR(F_NEXT_PTR(ptr), first_free);
+  }
+  // Otherwise, start populating the list
+  else {
+    printf(" - Empty list, prepending.\n");
+    F_SET_PTR(F_NEXT_PTR(ptr), NULL);
+  }
   F_SET_PTR(F_PREV_PTR(ptr), NULL);
   first_free = ptr;
   return;
 }
 
 /*
- * Deletes a node from the segregated free lists
+ * Deletes a node from the explicit free list (remove linked-list pointers)
  * Case 1: Has a previous and a next free block
  * Case 2: Has a previous free block only
  * Case 3: Has a next free block only
  * Case 4: No previous or next free blocks
  */
 static void delete_node(void *ptr) {
+  printf("delete_node called\n - Block size: %ld\n", GET_SIZE(HDRP(ptr)));
+  // Don't delete a nonexistent node
+  if (ptr == NULL)
+    return;
   if (F_PREV(ptr) != NULL) {
     if (F_NEXT(ptr) != NULL) {  // Case 1
+      printf(" - Case 1, middle of the list\n");
       F_SET_PTR(F_NEXT_PTR(F_PREV(ptr)), F_NEXT(ptr));
       F_SET_PTR(F_PREV_PTR(F_NEXT(ptr)), F_PREV(ptr));
     }
     else {                      // Case 2
+      printf(" - Case 2, bottom of the list\n");
       F_SET_PTR(F_NEXT_PTR(F_PREV(ptr)), NULL);
     }
   }
   else {
     if (F_NEXT(ptr) != NULL) {    // Case 3
+      printf(" - Case 3, top of the list\n");
       F_SET_PTR(F_PREV_PTR(F_NEXT(ptr)), NULL);
       first_free = F_NEXT(ptr);
     }
     else {                      // Case 4
+      printf(" - Case 4, only item in list\n");
       first_free = NULL;
     }
   }
-
   return;
 }
 
@@ -114,23 +134,31 @@ static void delete_node(void *ptr) {
  * Split block if applicable
  */
 static void *set_allocated(void *ptr, size_t asize) {
+  printf("set_allocated called\n");
+  // Don't allocate a nonexistent block
+  if (ptr == NULL)
+    return NULL;
   size_t free_size = GET_SIZE(HDRP(ptr));
   size_t remain = free_size - asize;
+  printf(" - Block size: %ld, Needed: %ld, Remainder: %ld\n",
+         free_size, asize, remain);
 
+  // Remove the block from the free list
   delete_node(ptr);
 
-  if (remain <= OVERHEAD * 2) {  // Remainder too small to split
+  if (remain <= OVERHEAD * 2) {  // Remainder too small for splitting
+    printf(" - Too small for splitting, allocate whole block.\n");
     PUT(HDRP(ptr), PACK(free_size, 1));
     PUT(FTRP(ptr), PACK(free_size, 1));
   }
-  else {  // Split block
+  else {  // Split block and add the remainder back to the free list
+    printf(" - Large enough for splitting.\n");
     PUT(HDRP(ptr), PACK(asize, 1));
     PUT(FTRP(ptr), PACK(asize, 1));
     PUT(HDRP(NEXT_BLKP(ptr)), PACK(remain, 0));
     PUT(FTRP(NEXT_BLKP(ptr)), PACK(remain, 0));
     insert_node(NEXT_BLKP(ptr), remain);
   }
-
   return ptr;
 }
 
@@ -143,10 +171,13 @@ static void *set_allocated(void *ptr, size_t asize) {
  * Update free list if applicable
  */
 static void *extend(size_t asize) {
+  printf("extend called\n - Requesting %ld bytes\n", asize);
   void *ptr;
 
-  if ((ptr = mem_map(asize)) == (void *)-1)
+  if ((long)(ptr = mem_map(asize)) == -1)
     return NULL;
+
+  printf(" - Base address of new chunk: %p\n", ptr);
 
   // After 8 bytes of padding, set sentinel block of size OVERHEAD as allocated
   PUT(HDRP(ptr+OVERHEAD), PACK(OVERHEAD, 1));
@@ -154,8 +185,8 @@ static void *extend(size_t asize) {
   // Add terminator at end of page
   PUT(HDRP(ptr+asize), PACK(0, 1));
   // Add a free block spanning the middle of the page
-  ptr += OVERHEAD << 1;
-  asize -= OVERHEAD + sizeof(block_header);
+  ptr += OVERHEAD * 2;
+  asize -= OVERHEAD * 2;
   PUT(HDRP(ptr), PACK(asize, 0));
   PUT(FTRP(ptr), PACK(asize, 0));
 
@@ -168,16 +199,25 @@ static void *extend(size_t asize) {
  * Should be called after coalesce() does its work.
  * The chunk is empty if the left and right neighbors are sentinels.
  */
-static void check_chunk(void *ptr) {
+static void *check_chunk(void *ptr) {
+  printf("check_chunk called\n");
+  if (ptr == NULL)
+    return NULL;
   size_t prev_size = GET_SIZE(HDRP(PREV_BLKP(ptr)));
   size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+  printf(" - Previous block: %ld bytes, Next block: %ld bytes\n",
+         prev_size, next_size);
 
   if (prev_size == OVERHEAD && next_size == 0) {  // Free the chunk
+    delete_node(ptr);
     size_t size = GET_SIZE(HDRP(ptr)) + OVERHEAD * 2;
     ptr -= OVERHEAD * 2;
-    delete_node(ptr);
+    printf(" - Freeing a chunk of %ld bytes at %p\n", size, ptr);
     mem_unmap(ptr, size);
+    ptr = NULL;
   }
+
+  return ptr;
 }
 
 /*
@@ -189,14 +229,20 @@ static void check_chunk(void *ptr) {
  * Case 4: Previous and next blocks are free.
  */
 static void *coalesce(void *ptr) {
+  printf("coalesce called\n");
+  if (ptr == NULL)
+    return NULL;
   size_t prev_alloc = GET_ALLOC(HDRP(PREV_BLKP(ptr)));
   size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
   size_t size = GET_SIZE(HDRP(ptr));
+  printf(" - Original size: %ld bytes\n", size);
 
   if (prev_alloc && next_alloc) {        // Case 1 (return as-is)
+    printf(" - Case 1, no adjacent free blocks.\n");
     return ptr;
   }
   else if (prev_alloc && !next_alloc) {  // Case 2 (coalesce with right)
+    printf(" - Case 2, right block is free.\n");
     delete_node(ptr);
     delete_node(NEXT_BLKP(ptr));
     size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));
@@ -204,6 +250,7 @@ static void *coalesce(void *ptr) {
     PUT(FTRP(ptr), PACK(size, 0));
   }
   else if (!prev_alloc && next_alloc) {  // Case 3 (coalesce with left)
+    printf(" - Case 3, left block is free.\n");
     delete_node(ptr);
     delete_node(PREV_BLKP(ptr));
     size += GET_SIZE(HDRP(PREV_BLKP(ptr)));
@@ -212,14 +259,17 @@ static void *coalesce(void *ptr) {
     ptr = PREV_BLKP(ptr);
   }
   else {                                 // Case 4 (coalesce with both sides)
+    printf(" - Case 4, both right and left blocks are free.\n");
     delete_node(ptr);
     delete_node(PREV_BLKP(ptr));
     delete_node(NEXT_BLKP(ptr));
     size += GET_SIZE(HDRP(PREV_BLKP(ptr))) + GET_SIZE(HDRP(NEXT_BLKP(ptr)));
     PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
-    PUT(FTRP(NEXT_BLKP(ptr)), PACK(size, 0));
+    PUT(FTRP(PREV_BLKP(ptr)), PACK(size, 0));
     ptr = PREV_BLKP(ptr);
   }
+
+  printf(" - New size: %ld bytes\n", size);
 
   insert_node(ptr, size);
   return ptr;
@@ -231,7 +281,7 @@ static void *coalesce(void *ptr) {
  */
 int mm_init(void)
 {
-  printf("mm_init called.");
+  printf("\nmm_init called\n");
   first_free = NULL;
   return 0;
 }
@@ -242,6 +292,7 @@ int mm_init(void)
  */
 void *mm_malloc(size_t size)
 {
+  printf("\nmm_malloc called\n - Requesting %ld bytes\n", size);
   // Ignore size 0 cases
   if (size == 0)
     return NULL;
@@ -249,20 +300,25 @@ void *mm_malloc(size_t size)
   // Align block size
   size_t asize = ALIGN(size + OVERHEAD);
   void *ptr = first_free;
+  printf(" - Aligned size: %ld bytes\n", asize);
 
   // Search for a free block of adequate size
   while (ptr != NULL) {
-    if (asize > GET_SIZE(HDRP(ptr))) {  // Too small, check next free block
+    size_t block_size = GET_SIZE(HDRP(ptr));
+    if (asize > block_size) {  // Too small, check next free block
+      printf(" - Free block of size %ld, too small\n", block_size);
       ptr = F_NEXT(ptr);
       continue;
     }
     else {  // Size is adequate. Proceed to allocation
+      printf(" - Free block of size %ld, big enough\n", block_size);
       break;
     }
   }
 
   // If a free block that fits isn't found, extend the heap
   if (ptr == NULL) {
+    printf(" - No free blocks of adequate size.\n");
     size_t extendsize = PAGE_ALIGN(asize);
     if ((ptr = extend(extendsize)) == NULL)
       return NULL;
@@ -280,6 +336,9 @@ void *mm_malloc(size_t size)
  */
 void mm_free(void *ptr)
 {
+  printf("\nmm_free called\n");
+  if (ptr == NULL)
+    return;
   // Set the header allocated bit to 0
   block_header* hdr = (block_header *)HDRP(ptr);
   size_t size = GET_SIZE(hdr);
@@ -289,10 +348,12 @@ void mm_free(void *ptr)
   block_footer* ftr = (block_footer *)FTRP(ptr);
   PUT(ftr, PACK(size, 0));
 
+  printf(" - Freeing block of size %ld\n", size);
+
   // Coalesce, if applicable
   insert_node(ptr, size);
-  coalesce(ptr);
-  check_chunk(ptr);
+  ptr = coalesce(ptr);
+  ptr = check_chunk(ptr);
 
   return;
 }
